@@ -836,7 +836,7 @@ async def _edit_safe(msg, text: str, **kwargs):
 #  MAIN
 # ============================================================================
 
-def main():
+async def _async_main():
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         raise SystemExit("Set BOT_TOKEN env var or fill it in bot.py")
 
@@ -853,7 +853,24 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     log.info("Bot polling...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    async with app:
+        await app.initialize()
+        await app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+        await app.start()
+        # keep running until killed
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+
+
+def main():
+    asyncio.run(_async_main())
 
 
 if __name__ == "__main__":
