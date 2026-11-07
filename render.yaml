@@ -1,15 +1,15 @@
+# render.yaml
 services:
-  - type: worker          # background worker — no open port needed for a polling bot
-    name: swiggy-firebase-bot
+  - type: web
+    name: swiggy-firebase-creator
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
-        sync: false       # set manually in Render dashboard
-      - key: ADMIN_IDS
-        sync: false       # comma-separated Telegram user IDs, e.g. "123456789,987654321"
-    disk:
-      name: sessions
-      mountPath: /opt/render/project/src/sessions
-      sizeGB: 1
+        sync: false
+      - key: DATA_DIR
+        value: /tmp/swiggy_fb
+      - key: PYTHON_VERSION
+        value: "3.11.9"
